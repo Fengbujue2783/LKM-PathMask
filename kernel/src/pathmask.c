@@ -23,8 +23,10 @@
 #include <linux/string.h>
 #include <linux/uidgid.h>
 #include <linux/uaccess.h>
-#include <linux/fdtable.h>
 #include <linux/sched.h>
+#include <linux/sched/task_stack.h>
+#include <linux/file.h>
+#include <linux/fdtable.h>
 #include <asm/syscall.h>
 #include <asm/unistd.h>
 
@@ -1040,7 +1042,7 @@ static int do_maps_swap(long *ret)
 		return (int)PTR_ERR(fake_file);
 	}
 
-	err = pm_invoke_replace_fd((unsigned int)orig_fd, fake_file, 0);
+	err = pm_invoke_replace_fd((unsigned int)orig_fd, fake_file);
 	if (err == 0) {
 		if (atomic_cmpxchg(&pm_maps_seen, 0, 1) == 0)
 			pr_info(PM_LOG_PREFIX "maps fd swapped (replace_fd)\n");
