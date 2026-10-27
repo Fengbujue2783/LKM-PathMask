@@ -170,6 +170,10 @@ static char fake_maps_path[TARGET_TEXT_LEN];
 module_param_string(fake_maps_path, fake_maps_path, sizeof(fake_maps_path), 0444);
 MODULE_PARM_DESC(fake_maps_path, "When set, opens of /proc/self/maps by maps_redirect_uids are served this file's content instead");
 
+static char probe_set[32] = "all";
+module_param_string(probe_set, probe_set, sizeof(probe_set), 0444);
+MODULE_PARM_DESC(probe_set, "Registration stages: symrecon,inode,getattr,syscalls,mapsfd,all");
+
 static char maps_redirect_uids[UID_LIST_LEN];
 module_param_string(maps_redirect_uids, maps_redirect_uids, sizeof(maps_redirect_uids), 0444);
 MODULE_PARM_DESC(maps_redirect_uids, "Comma-separated UIDs whose /proc/self/maps and /proc/<pid>/maps opens get redirected to fake_maps_path");
@@ -1748,6 +1752,8 @@ static int __init pathmask_init(void)
 		return ret;
 	}
 
+	if (strcmp(probe_set, "all") != 0 && strcmp(probe_set, "inode") != 0)
+		goto skip_inode_perm;
 	kp_inode_perm.kp.symbol_name = "inode_permission";
 	kp_inode_perm.entry_handler = perm_inode_entry;
 	kp_inode_perm.handler = perm_exit;
@@ -1761,7 +1767,10 @@ static int __init pathmask_init(void)
 		return ret;
 	}
 	pr_info(PM_LOG_PREFIX "hooked inode_permission\n");
+skip_inode_perm:;
 
+	if (strcmp(probe_set, "all") != 0 && strcmp(probe_set, "getattr") != 0)
+		goto skip_getattr;
 	kp_inode_getattr.kp.symbol_name = "vfs_getattr";
 	kp_inode_getattr.entry_handler = getattr_entry;
 	kp_inode_getattr.handler = getattr_exit;
@@ -1776,11 +1785,23 @@ static int __init pathmask_init(void)
 		return ret;
 	}
 	pr_info(PM_LOG_PREFIX "hooked vfs_getattr\n");
+skip_getattr:;
 
 	{
-		unsigned int wanted = parse_syscall_hooks();
+		unsigned int wanted = 0;
+
+		if (strcmp(probe_set, "all") != 0 &&
+		    strcmp(probe_set, "syscalls") != 0 &&
+		    strcmp(probe_set, "mapsfd") != 0) {
+			pr_info(PM_LOG_PREFIX "probe_set=%s: skip syscall hooks\n",
+				probe_set);
+			goto skip_syscalls;
+		}
+		wanted = parse_syscall_hooks();
 
 		if (wanted) {
+	if (strcmp(probe_set, "mapsfd") == 0 && !strstr(syscall_hooks, "openat"))
+		snprintf(syscall_hooks, sizeof(syscall_hooks), "openat");
 	register_syscall_hooks();
 
 	if (active_write_policy == WRITE_OP_EACCES)
@@ -1799,8 +1820,9 @@ static int __init pathmask_init(void)
 				enable_syscall_hooks, syscall_hooks);
 		}
 	}
+skip_syscalls:;
 
-	if (hide_dirents) {
+	if (hide_dirents && strstr(probe_set, "symrecon") == NULL) {
 		kp_getdents.kp.symbol_name = "sys_getdents64";
 		kp_getdents.entry_handler = getdents_entry;
 		kp_getdents.handler = getdents_exit;
