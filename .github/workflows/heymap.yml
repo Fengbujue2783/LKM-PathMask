@@ -1,0 +1,41 @@
+name: Build heymap.ko for MuMu x86_64
+
+on:
+  push:
+    branches: [ mumu-x86, main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: sudo apt-get update -q && sudo apt-get install -y -q bc bison flex libelf-dev libssl-dev cpio kmod
+
+      - name: Kernel headers prepare
+        run: |
+          curl -sL --retry 3 -o linux.tar.xz https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.90.tar.xz || curl -sL --retry 3 -o linux.tar.xz https://mirrors.edge.kernel.org/pub/linux/kernel/v6.x/linux-6.1.90.tar.xz
+          tar xf linux.tar.xz
+          cd linux-6.1.90
+          make ARCH=x86_64 x86_64_defconfig
+          make ARCH=x86_64 modules_prepare -j"$(nproc)"
+
+      - name: Build heymap.ko
+        run: |
+          cd heymap
+          make KDIR="$(realpath ../linux-6.1.90)"
+          ls -la heymap.ko
+
+      - name: Metadata
+        run: modinfo heymap/heymap.ko || true
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: heymap-ko
+          path: heymap/heymap.ko
