@@ -1,0 +1,63 @@
+name: Build PathMask for MuMu x86_64 (6.1.90-perf+)
+
+on:
+  push:
+    branches: [ mumu-x86, main ]
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-mumu-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install build deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bc bison flex libelf-dev libssl-dev \
+            lzop cpio kmod dwarves python3-dev
+
+      - name: Checkout module source
+        uses: actions/checkout@v4
+
+      - name: Fetch vanilla 6.1.90 kernel headers (modules_prepare)
+        run: |
+          curl -sL --retry 3 -o linux-6.1.90.tar.xz \
+            https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.90.tar.xz \
+            || curl -sL --retry 3 -o linux-6.1.90.tar.xz \
+            https://mirrors.edge.kernel.org/pub/linux/kernel/v6.x/linux-6.1.90.tar.xz
+          tar xf linux-6.1.90.tar.xz
+          cd linux-6.1.90
+          make ARCH=x86_64 x86_64_defconfig
+          # enable kprobes/kretprobes + ftrace (already on in defconfig; keep safe)
+          ./scripts/config --enable CONFIG_KPROBES --enable CONFIG_KRETPROBES \
+            --enable CONFIG_KALLSYMS --enable CONFIG_KALLSYMS_ALL \
+            --enable CONFIG_MODULES --enable CONFIG_FTRACE \
+            --enable CONFIG_FUNCTION_TRACER --enable CONFIG_HAVE_KRETPROBES
+          make ARCH=x86_64 olddefconfig
+          make ARCH=x86_64 modules_prepare -j"$(nproc)"
+          echo "== utsrelease =="
+          cat include/generated/utsrelease.h
+
+      - name: Build pathmask.ko
+        run: |
+          cd kernel
+          sh scripts/fetch-deps.sh
+          make KDIR="$(realpath ../linux-6.1.90)" VER=mumu-x86_64 CC=clang CONFIG_KSU=m
+          find out/mumu-x86_64 -name '*.ko' -exec ls -la {} \;
+
+      - name: Show module metadata
+        run: |
+          cd kernel/out/mumu-x86_64
+          modinfo pathmask.ko || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pathmask-mumu-x86_64
+          path: |
+            kernel/out/mumu-x86_64/pathmask.ko
+            kernel/out/mumu-x86_64/procguard.ko
+          if-no-files-found: error
