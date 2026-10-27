@@ -45,7 +45,7 @@ jobs:
         run: |
           cd kernel
           sh scripts/fetch-deps.sh
-          make KDIR="$(realpath ../linux-6.1.90)" VER=mumu-x86_64 CC=clang CONFIG_KSU=m
+          make KDIR="$(realpath ../linux-6.1.90)" VER=mumu-x86_64 CONFIG_KSU=m
           find out/mumu-x86_64 -name '*.ko' -exec ls -la {} \;
 
       - name: Show module metadata
