@@ -147,9 +147,14 @@ static int pg_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (atomic_cmpxchg(&pg_seen, 0, 1) == 0)
 		pr_info(PG_LOG_PREFIX "in_group_p hook fired (first time)\n");
 
-	/* arm64 ABI: kgid_t (single u32) is passed by value in w0. */
+	/* arm64: kgid_t in w0; x86_64: gid in di (first arg). */
+#ifdef CONFIG_X86_64
+	if ((gid_t)(u32)regs->di == (gid_t)target_gid &&
+	    pg_isolated_caller())
+#else
 	if ((gid_t)(u32)regs->regs[0] == (gid_t)target_gid &&
 	    pg_isolated_caller())
+#endif
 		d->matched = true;
 
 	return 0;
