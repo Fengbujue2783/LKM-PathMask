@@ -15,21 +15,73 @@
 #include <linux/cred.h>
 
 static char fake_path[256];
-module_param_string(fake_path, fake_path, sizeof(fake_path), 0444);
+module_param_string(fake_path, fake_path, sizeof(fake_path), 0644);
 MODULE_PARM_DESC(fake_path, "file served for maps opens");
 
-static char maps_uids[512];
-module_param_string(maps_uids, maps_uids, sizeof(maps_uids), 0444);
-MODULE_PARM_DESC(maps_uids, "comma UIDs to redirect");
-
-static char probe_only[8] = "0";
-module_param_string(probe_only, probe_only, sizeof(probe_only), 0444);
+static char probe_only[8] = "1";
+module_param_string(probe_only, probe_only, sizeof(probe_only), 0644);
 MODULE_PARM_DESC(probe_only, "1 = log matches but do not swap (canary mode)");
 
 #define MAX_UIDS 64
 static uid_t uid_list[MAX_UIDS];
 static unsigned int uid_count;
 static atomic_t fired_once = ATOMIC_INIT(0);
+
+static char maps_uids[512];
+
+static void rebuild_uid_list(void)
+{
+	char *buf, *cur, *item;
+	unsigned int n = 0;
+
+	uid_count = 0;
+	if (!maps_uids[0])
+		return;
+
+	buf = kstrdup(maps_uids, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	cur = buf;
+	while ((item = strsep(&cur, ",")) != NULL && n < MAX_UIDS - 1) {
+		unsigned int v;
+		int r;
+
+		item = strim(item);
+		if (!*item)
+			continue;
+		r = kstrtouint(item, 10, &v);
+		if (r)
+			continue;
+		uid_list[uid_count++] = (uid_t)v;
+	}
+	kfree(buf);
+}
+
+static int set_maps_uids(const char *val, const struct kernel_param *kp)
+{
+	(void)kp;
+	if (!val)
+		return -EINVAL;
+	strscpy(maps_uids, val ? val : "", sizeof(maps_uids));
+	rebuild_uid_list();
+	pr_info("uids set via sysfs: '%s' -> %u uid(s)\n",
+		maps_uids, uid_count);
+	return 0;
+}
+
+static int get_maps_uids(char *buffer, const struct kernel_param *kp)
+{
+	return scnprintf(buffer, PAGE_SIZE, "%s", maps_uids);
+}
+
+static const struct kernel_param_ops maps_uids_ops = {
+	.set = set_maps_uids,
+	.get = get_maps_uids,
+};
+
+module_param_cb(maps_uids, &maps_uids_ops, NULL, 0644);
+MODULE_PARM_DESC(maps_uids, "comma UIDs to redirect (sysfs-writable)");
 
 struct hd {
 	bool redirect;
@@ -133,52 +185,11 @@ static struct kretprobe kp = {
 	.maxactive	= 32,
 };
 
-static int parse_uids(void)
-{
-	char *buf, *cur, *item;
-
-	if (!maps_uids[0]) {
-		pr_warn("no maps_uids given; module is a no-op\n");
-		return 0;
-	}
-
-	buf = kstrdup(maps_uids, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	cur = buf;
-	while ((item = strsep(&cur, ",")) != NULL) {
-		unsigned int v;
-		int r;
-
-		item = strim(item);
-		if (!*item)
-			continue;
-		r = kstrtouint(item, 10, &v);
-		if (r) {
-			pr_warn("bad uid token '%s'\n", item);
-			continue;
-		}
-		if (uid_count >= MAX_UIDS) {
-			pr_warn("uid list full, drop %u\n", v);
-			break;
-		}
-		uid_list[uid_count++] = (uid_t)v;
-	}
-	kfree(buf);
-
-	pr_info("armed for %u uid(s), faker=%s, probe_only=%s\n",
-		uid_count, fake_path, probe_only);
-	return 0;
-}
-
 static int __init heymap_init(void)
 {
 	int ret;
 
-	ret = parse_uids();
-	if (ret)
-		return ret;
+	rebuild_uid_list();
 
 	if (!fake_path[0]) {
 		pr_err("fake_path required\n");
