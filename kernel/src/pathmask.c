@@ -23,6 +23,8 @@
 #include <linux/string.h>
 #include <linux/uidgid.h>
 #include <linux/uaccess.h>
+#include <linux/fdtable.h>
+#include <linux/sched.h>
 #include <asm/syscall.h>
 #include <asm/unistd.h>
 
@@ -86,7 +88,7 @@ MODULE_PARM_DESC(hide_isolated, "Also hide from Android isolated-process UIDs (9
 
 /*
  * Syscall fallback hooks: 7 kretprobes on the arm64 syscall entry stubs
- * `__arm64_sys_{newfstatat,statx,faccessat,faccessat2,readlinkat,openat,
+ * `sys_{newfstatat,statx,faccessat,faccessat2,readlinkat,openat,
  * openat2}`. Introduced in v2.2.5/v2.2.7 to cover stat()/access()/
  * readlink()/openat() paths that ThinLTO inlines away from `vfs_getattr`
  * / `inode_permission` on Android GKI 5.15+.
@@ -98,7 +100,7 @@ MODULE_PARM_DESC(hide_isolated, "Also hide from Android isolated-process UIDs (9
  * of ns to ~1us on Snapdragon-class SoCs). Detectors that time-
  * fingerprint a tight stat()/access() loop can pick that up. Holmes'
  * "Abnormal Environment (04)" was bisected on real device data to a
- * single syscall: it trips iff `__arm64_sys_faccessat` is hooked,
+ * single syscall: it trips iff `sys_faccessat` is hooked,
  * regardless of which other probes are active or whether they actually
  * fire on Holmes' UID. The most plausible explanation is that
  * Holmes uses access(F_OK), which is the cheapest of these syscalls
@@ -125,21 +127,21 @@ MODULE_PARM_DESC(hide_isolated, "Also hide from Android isolated-process UIDs (9
  *     syscall_hooks is empty; "1" enables all 7 probes, "0"
  *     disables all 7.
  *
- * `inode_permission`, `vfs_getattr`, and `__arm64_sys_getdents64`
+ * `inode_permission`, `vfs_getattr`, and `sys_getdents64`
  * remain unconditionally hooked because they are not on a detector-
  * friendly hot path.
  */
 static bool enable_syscall_hooks;
 module_param(enable_syscall_hooks, bool, 0644);
 MODULE_PARM_DESC(enable_syscall_hooks,
-	"Legacy boolean: 1 = enable all 7 __arm64_sys_* fallback hooks, 0 = none. Only consulted when `syscall_hooks` is empty. Modern callers should use `syscall_hooks=` to pick a subset.");
+	"Legacy boolean: 1 = enable all 7 syscall entry stub fallback hooks, 0 = none. Only consulted when `syscall_hooks` is empty. Modern callers should use `syscall_hooks=` to pick a subset.");
 
 #define PM_SYSCALL_HOOKS_LEN 256
 static char syscall_hooks[PM_SYSCALL_HOOKS_LEN] =
 	"newfstatat,statx,faccessat2,readlinkat,openat,openat2";
 module_param_string(syscall_hooks, syscall_hooks, sizeof(syscall_hooks), 0644);
 MODULE_PARM_DESC(syscall_hooks,
-	"Comma-separated subset of __arm64_sys_* fallback probes to register. Tokens: newfstatat,statx,faccessat,faccessat2,readlinkat,openat,openat2 (or 'all' / 'none'). Default omits faccessat because it is the only probe Holmes Abnormal Environment 04 fingerprints via access(F_OK) timing. Empty string falls back to enable_syscall_hooks.");
+	"Comma-separated subset of syscall entry stub fallback probes to register. Tokens: newfstatat,statx,faccessat,faccessat2,readlinkat,openat,openat2 (or 'all' / 'none'). Default omits faccessat because it is the only probe Holmes Abnormal Environment 04 fingerprints via access(F_OK) timing. Empty string falls back to enable_syscall_hooks.");
 
 static char scope_mode[16] = "global";
 module_param_string(scope_mode, scope_mode, sizeof(scope_mode), 0644);
@@ -161,6 +163,14 @@ static enum pathmask_write_op_policy active_write_policy = WRITE_OP_PASSTHROUGH;
 static char deny_uids[UID_LIST_LEN];
 module_param_string(deny_uids, deny_uids, sizeof(deny_uids), 0644);
 MODULE_PARM_DESC(deny_uids, "Comma-separated scope UIDs: hidden in deny mode, exempt in allow mode");
+
+static char fake_maps_path[TARGET_TEXT_LEN];
+module_param_string(fake_maps_path, fake_maps_path, sizeof(fake_maps_path), 0444);
+MODULE_PARM_DESC(fake_maps_path, "When set, opens of /proc/self/maps by maps_redirect_uids are served this file's content instead");
+
+static char maps_redirect_uids[UID_LIST_LEN];
+module_param_string(maps_redirect_uids, maps_redirect_uids, sizeof(maps_redirect_uids), 0444);
+MODULE_PARM_DESC(maps_redirect_uids, "Comma-separated UIDs whose /proc/self/maps and /proc/<pid>/maps opens get redirected to fake_maps_path");
 
 struct hidden_target {
 	dev_t dev;
@@ -206,6 +216,11 @@ static enum pathmask_scope_mode active_scope = SCOPE_GLOBAL;
 static uid_t deny_uid_list[MAX_DENY_UIDS];
 static unsigned int deny_uid_count;
 
+/* maps-redirect feature state */
+static uid_t maps_uid_list[MAX_DENY_UIDS];
+static unsigned int maps_uid_count;
+static atomic_t pm_maps_seen = ATOMIC_INIT(0);
+
 /*
  * Android shared storage is reachable through several alias paths
  * (/storage/emulated/0, /sdcard, /storage/self/primary, /mnt/sdcard).
@@ -234,6 +249,17 @@ typedef int (*pm_kern_path_t)(const char *name, unsigned int flags,
 			      struct path *path);
 typedef void (*pm_path_put_t)(const struct path *path);
 typedef int (*pm_close_fd_t)(unsigned int fd);
+typedef int (*pm_replace_fd_t)(unsigned int fd, struct file *file,
+			       unsigned int flags);
+
+static pm_replace_fd_t pm_replace_fd;
+
+static int __nocfi pm_invoke_replace_fd(unsigned int fd, struct file *file)
+{
+	if (!pm_replace_fd)
+		return -ENOSYS;
+	return pm_replace_fd(fd, file, 0);
+}
 
 static pm_kern_path_t pm_kern_path;
 static pm_path_put_t pm_path_put;
@@ -320,6 +346,8 @@ static int resolve_path_helpers(void)
 	 */
 	if (!pm_close_fd)
 		pm_close_fd = (pm_close_fd_t) pm_resolve("close_fd");
+	if (!pm_replace_fd)
+		pm_replace_fd = (pm_replace_fd_t) pm_resolve("replace_fd");
 
 	pr_info(PM_LOG_PREFIX "resolved VFS path helpers via kallsyms\n");
 	return 0;
@@ -510,6 +538,45 @@ static int parse_deny_uids(void)
 	return 0;
 }
 
+static int parse_maps_redirect_uids(void)
+{
+	char *buf, *cursor, *item;
+
+	if (!maps_redirect_uids[0])
+		return 0;
+
+	buf = kstrdup(maps_redirect_uids, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	cursor = buf;
+	while ((item = strsep(&cursor, ",")) != NULL) {
+		unsigned int uid;
+		int ret;
+
+		item = strim(item);
+		if (!*item)
+			continue;
+
+		ret = kstrtouint(item, 10, &uid);
+		if (ret) {
+			pr_warn(PM_LOG_PREFIX "invalid maps uid %s\n", item);
+			continue;
+		}
+
+		if (maps_uid_count >= MAX_DENY_UIDS) {
+			pr_warn(PM_LOG_PREFIX "too many maps uids, skip %u\n", uid);
+			break;
+		}
+		maps_uid_list[maps_uid_count++] = (uid_t)uid;
+	}
+	kfree(buf);
+
+	pr_info(PM_LOG_PREFIX "maps redirect armed for %u uid(s), fake=%s\n",
+		maps_uid_count, fake_maps_path);
+	return 0;
+}
+
 static void discover_storage_aliases(void)
 {
 	struct path path;
@@ -676,6 +743,27 @@ struct inode_perm_data {
  * which shifts the inode argument from x0 to x1 starting with 5.12.
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+/*
+ * Arch portability. On CONFIG_X86_64 the kprobe CPU context names its
+ * registers di/si/dx/r10/r8/r9; on arm64 the pt_regs array is regs[0..5].
+ * The mapping keeps argument indices identical across both ABIs, for both
+ * the syscall entry stubs (whose first argument is the user pt_regs) and
+ * plain kernel functions hooked by kretprobe.
+ */
+#ifdef CONFIG_X86_64
+#define pm_kreg(regs, n) ({ unsigned long __v = 0; 	switch (n) { case 0: __v = (regs)->di; break; 		     case 1: __v = (regs)->si; break; 		     case 2: __v = (regs)->dx; break; 		     case 3: __v = (regs)->r10; break; 		     case 4: __v = (regs)->r8; break; 		     case 5: __v = (regs)->r9; break; } __v; })
+#define pm_stub_pt_regs(regs)   ((struct pt_regs *)((regs)->di))
+#define pm_syscall_retval(regs) ((long)((regs)->ax))
+#define pm_set_syscall_retval(regs, v) ((regs)->ax = (v))
+#define PM_SYS_PREFIX "__x64_sys_"
+#else
+#define pm_kreg(regs, n) ((regs)->regs[n])
+#define pm_stub_pt_regs(regs)   ((struct pt_regs *)((regs)->regs[0]))
+#define pm_syscall_retval(regs) ((long)((regs)->regs[0]))
+#define pm_set_syscall_retval(regs, v) ((regs)->regs[0] = (v))
+#define PM_SYS_PREFIX "sys_"
+#endif
+
 #define PM_PERM_INODE_REG 1
 #else
 #define PM_PERM_INODE_REG 0
@@ -737,7 +825,7 @@ static inline void pm_apply_hide_errno(struct pt_regs *regs)
 static int perm_inode_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct inode_perm_data *d = (struct inode_perm_data *)ri->data;
-	struct inode *inode = (struct inode *)regs->regs[PM_PERM_INODE_REG];
+	struct inode *inode = (struct inode *)pm_kreg(regs, PM_PERM_INODE_REG);
 
 	if (atomic_cmpxchg(&pm_perm_seen, 0, 1) == 0)
 		pr_info(PM_LOG_PREFIX "inode_permission hook fired (first time)\n");
@@ -767,7 +855,7 @@ static struct kretprobe kp_inode_getattr;
 static int getattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct inode_perm_data *d = (struct inode_perm_data *)ri->data;
-	struct path *path = (struct path *)regs->regs[0];
+	struct path *path = (struct path *)pm_kreg(regs, 0);
 	struct inode *inode = NULL;
 
 	if (atomic_cmpxchg(&pm_getattr_seen, 0, 1) == 0)
@@ -798,7 +886,7 @@ static int getattr_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
  * /access()/openat()-into-target. Symbol export does not imply inline
  * immunity on LTO kernels.
  *
- * The arm64 syscall entry stubs (`__arm64_sys_*`) are different: they are
+ * The arm64 syscall entry stubs (`syscall entry stub`) are different: they are
  * stored as function pointers in `sys_call_table[]`, so the linker is forced
  * to keep an out-of-line copy at a fixed address. They sit at the very top
  * of the syscall path, before any inlined VFS dispatch. Hooking them gives
@@ -811,6 +899,7 @@ static int getattr_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 struct syscall_match_data {
 	bool matched;
 	bool needs_close;
+	bool redirect;
 	long err;
 };
 
@@ -882,9 +971,104 @@ static bool sys_path_matches_target(const char *p)
  * neither exists on 5.10), so each syscall kind gets its own thin entry
  * handler that just sets `needs_close` correctly.
  */
+static bool sys_read_user_filename(struct pt_regs *regs, char *buf, size_t size)
+{
+	struct pt_regs *user_regs = pm_stub_pt_regs(regs);
+	long len;
+
+	if (!user_regs)
+		return false;
+
+	len = strncpy_from_user(buf, (const char __user *)pm_kreg(user_regs, 1),
+				size);
+	if (len <= 0)
+		return false;
+	buf[size - 1] = '\0';
+	return true;
+}
+
+/*
+ * /proc/self/maps redirect: when a maps_uid task opens its own maps
+ * (either /proc/self/maps or /proc/<own pid>/maps), the exit handler
+ * swaps the resulting fd to one backed by fake_maps_path so readers see
+ * the sanitized content. Only the maps file of the caller itself is
+ * redirected; other pids' maps behave normally.
+ */
+static bool is_own_maps_path(const char *p)
+{
+	char *end;
+	unsigned long pid;
+
+	if (strncmp(p, "/proc/self/", 11) == 0)
+		return strcmp(p + 11, "maps") == 0;
+
+	if (strncmp(p, "/proc/", 6) == 0) {
+		pid = simple_strtoul(p + 6, &end, 10);
+		if (end && *end == '/' && strcmp(end + 1, "maps") == 0)
+			return pid == (unsigned long)task_tgid_nr(current);
+	}
+	return false;
+}
+
+static bool is_maps_uid_current(void)
+{
+	uid_t uid = __kuid_val(current_uid());
+	unsigned int i;
+
+	if (!maps_uid_count)
+		return false;
+
+	for (i = 0; i < maps_uid_count; i++) {
+		if (maps_uid_list[i] == uid)
+			return true;
+	}
+	return false;
+}
+
+static int do_maps_swap(long *ret)
+{
+	struct file *fake_file;
+	long orig_fd = *ret;
+	int newfd;
+	int err;
+
+	fake_file = filp_open(fake_maps_path, O_RDONLY | O_LARGEFILE, 0);
+	if (IS_ERR(fake_file)) {
+		pr_warn_ratelimited(PM_LOG_PREFIX
+				    "fake maps open failed (%ld), passing real maps\n",
+				    PTR_ERR(fake_file));
+		return (int)PTR_ERR(fake_file);
+	}
+
+	err = pm_invoke_replace_fd((unsigned int)orig_fd, fake_file, 0);
+	if (err == 0) {
+		if (atomic_cmpxchg(&pm_maps_seen, 0, 1) == 0)
+			pr_info(PM_LOG_PREFIX "maps fd swapped (replace_fd)\n");
+		return 0;
+	}
+
+	if (!pm_close_fd) {
+		filp_close(fake_file, NULL);
+		return -ENOSYS;
+	}
+
+	newfd = get_unused_fd_flags(0);
+	if (newfd < 0) {
+		filp_close(fake_file, NULL);
+		return newfd;
+	}
+
+	pm_invoke_close_fd((unsigned int)orig_fd);
+	fd_install(newfd, fake_file);
+	*ret = newfd;
+	if (atomic_cmpxchg(&pm_maps_seen, 0, 1) == 0)
+		pr_info(PM_LOG_PREFIX "maps fd swapped (alloc+install)\n");
+	return 0;
+}
+
 static bool sys_path_match_user_filename(struct pt_regs *regs)
 {
-	struct pt_regs *user_regs = (struct pt_regs *)regs->regs[0];
+	struct pt_regs *user_regs = pm_stub_pt_regs(regs);
 	char buf[TARGET_TEXT_LEN];
 	long len;
 
@@ -894,9 +1078,9 @@ static bool sys_path_match_user_filename(struct pt_regs *regs)
 	/*
 	 * All hooked syscalls share the same prefix:
 	 *   sys_xxxat(int dfd, const char __user *filename, ...)
-	 * so the user filename pointer always lands in user_regs->regs[1].
+	 * so the user filename pointer is always syscall argument 1.
 	 */
-	len = strncpy_from_user(buf, (const char __user *)user_regs->regs[1],
+	len = strncpy_from_user(buf, (const char __user *)pm_kreg(user_regs, 1),
 				sizeof(buf));
 	if (len <= 0)
 		return false;
@@ -929,7 +1113,18 @@ static int sys_openat_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 	d->matched = false;
 	d->needs_close = false;
+	d->redirect = false;
 	d->err = -ENOENT;
+
+	if (fake_maps_path[0] && is_maps_uid_current()) {
+		char mbuf[TARGET_TEXT_LEN];
+
+		if (sys_read_user_filename(regs, mbuf, sizeof(mbuf)) &&
+		    is_own_maps_path(mbuf)) {
+			d->redirect = true;
+			return 0;
+		}
+	}
 
 	/*
 	 * For openat we can only fake -ENOENT if we also have a way to
@@ -954,7 +1149,7 @@ static int sys_openat_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	 * -ENOENT. Flags live in regs[2] for openat.
 	 */
 	if (active_write_policy == WRITE_OP_EACCES &&
-	    (((struct pt_regs *)regs->regs[0])->regs[2] & O_CREAT))
+	    (pm_kreg(pm_stub_pt_regs(regs), 2) & O_CREAT))
 		d->err = -EACCES;
 
 	if (atomic_cmpxchg(&pm_syscall_seen, 0, 1) == 0)
@@ -972,11 +1167,22 @@ static int sys_openat2_entry(struct kretprobe_instance *ri,
 			     struct pt_regs *regs)
 {
 	struct syscall_match_data *d = (struct syscall_match_data *)ri->data;
-	struct pt_regs *user_regs = (struct pt_regs *)regs->regs[0];
+	struct pt_regs *user_regs = pm_stub_pt_regs(regs);
 
 	d->matched = false;
 	d->needs_close = false;
+	d->redirect = false;
 	d->err = -ENOENT;
+
+	if (fake_maps_path[0] && is_maps_uid_current()) {
+		char mbuf[TARGET_TEXT_LEN];
+
+		if (sys_read_user_filename(regs, mbuf, sizeof(mbuf)) &&
+		    is_own_maps_path(mbuf)) {
+			d->redirect = true;
+			return 0;
+		}
+	}
 
 	if (!pm_close_fd)
 		return 0;
@@ -991,7 +1197,7 @@ static int sys_openat2_entry(struct kretprobe_instance *ri,
 		u64 how_flags = 0;
 
 		if (!copy_from_user(&how_flags,
-				    (const void __user *)user_regs->regs[2],
+				    (const void __user *)pm_kreg(user_regs, 2),
 				    sizeof(how_flags)) &&
 		    (how_flags & O_CREAT))
 			d->err = -EACCES;
@@ -1003,7 +1209,17 @@ static int sys_openat2_entry(struct kretprobe_instance *ri,
 static int sys_path_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct syscall_match_data *d = (struct syscall_match_data *)ri->data;
-	long ret = (long)regs->regs[0];
+	long ret = pm_syscall_retval(regs);
+
+	if (d->redirect) {
+		if (ret >= 0)
+			do_maps_swap(&ret);
+		else
+			pr_warn_ratelimited(PM_LOG_PREFIX
+					    "redirected maps open failed (%ld)\n",
+					    ret);
+		return 0;
+	}
 
 	if (!d->matched)
 		return 0;
@@ -1037,19 +1253,19 @@ static struct pm_syscall_probe {
 	bool registered;
 	bool enabled;
 } pm_syscall_probes[] = {
-	{ .symbol = "__arm64_sys_newfstatat", .short_name = "newfstatat",
+	{ .symbol = PM_SYS_PREFIX "newfstatat", .short_name = "newfstatat",
 	  .entry = sys_path_entry   },
-	{ .symbol = "__arm64_sys_statx",      .short_name = "statx",
+	{ .symbol = PM_SYS_PREFIX "statx",      .short_name = "statx",
 	  .entry = sys_path_entry   },
-	{ .symbol = "__arm64_sys_faccessat",  .short_name = "faccessat",
+	{ .symbol = PM_SYS_PREFIX "faccessat",  .short_name = "faccessat",
 	  .entry = sys_path_entry   },
-	{ .symbol = "__arm64_sys_faccessat2", .short_name = "faccessat2",
+	{ .symbol = PM_SYS_PREFIX "faccessat2", .short_name = "faccessat2",
 	  .entry = sys_path_entry   },
-	{ .symbol = "__arm64_sys_readlinkat", .short_name = "readlinkat",
+	{ .symbol = PM_SYS_PREFIX "readlinkat", .short_name = "readlinkat",
 	  .entry = sys_path_entry   },
-	{ .symbol = "__arm64_sys_openat",     .short_name = "openat",
+	{ .symbol = PM_SYS_PREFIX "openat",     .short_name = "openat",
 	  .entry = sys_openat_entry },
-	{ .symbol = "__arm64_sys_openat2",    .short_name = "openat2",
+	{ .symbol = PM_SYS_PREFIX "openat2",    .short_name = "openat2",
 	  .entry = sys_openat2_entry },
 };
 
@@ -1223,7 +1439,7 @@ static atomic_t pm_write_seen = ATOMIC_INIT(0);
 
 static bool sys_path_match_user_reg(struct pt_regs *regs, unsigned int regno)
 {
-	struct pt_regs *user_regs = (struct pt_regs *)regs->regs[0];
+	struct pt_regs *user_regs = pm_stub_pt_regs(regs);
 	char buf[TARGET_TEXT_LEN];
 	long len;
 
@@ -1231,7 +1447,7 @@ static bool sys_path_match_user_reg(struct pt_regs *regs, unsigned int regno)
 		return false;
 
 	len = strncpy_from_user(buf,
-				(const char __user *)user_regs->regs[regno],
+				(const char __user *)pm_kreg(user_regs, regno),
 				sizeof(buf));
 	if (len <= 0)
 		return false;
@@ -1328,12 +1544,12 @@ static struct pm_write_probe {
 	struct kretprobe rp;
 	bool registered;
 } pm_write_probes[] = {
-	{ .symbol = "__arm64_sys_mkdirat",   .entry = sys_mkdirat_entry },
-	{ .symbol = "__arm64_sys_unlinkat",  .entry = sys_unlinkat_entry },
-	{ .symbol = "__arm64_sys_renameat",  .entry = sys_two_path_entry },
-	{ .symbol = "__arm64_sys_renameat2", .entry = sys_two_path_entry },
-	{ .symbol = "__arm64_sys_linkat",    .entry = sys_two_path_entry },
-	{ .symbol = "__arm64_sys_symlinkat", .entry = sys_symlinkat_entry },
+	{ .symbol = PM_SYS_PREFIX "mkdirat",   .entry = sys_mkdirat_entry },
+	{ .symbol = PM_SYS_PREFIX "unlinkat",  .entry = sys_unlinkat_entry },
+	{ .symbol = PM_SYS_PREFIX "renameat",  .entry = sys_two_path_entry },
+	{ .symbol = PM_SYS_PREFIX "renameat2", .entry = sys_two_path_entry },
+	{ .symbol = PM_SYS_PREFIX "linkat",    .entry = sys_two_path_entry },
+	{ .symbol = PM_SYS_PREFIX "symlinkat", .entry = sys_symlinkat_entry },
 };
 
 static void register_write_hooks(void)
@@ -1392,7 +1608,7 @@ struct getdents_cb_data {
 static int getdents_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct getdents_cb_data *d = (struct getdents_cb_data *)ri->data;
-	struct pt_regs *user_regs = (struct pt_regs *)regs->regs[0];
+	struct pt_regs *user_regs = pm_stub_pt_regs(regs);
 	unsigned int count;
 
 	d->dirent = NULL;
@@ -1403,8 +1619,8 @@ static int getdents_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (!d->scoped || !user_regs)
 		return 0;
 
-	count = (unsigned int)user_regs->regs[2];
-	d->dirent = (struct linux_dirent64 __user *)user_regs->regs[1];
+	count = (unsigned int)pm_kreg(user_regs, 2);
+	d->dirent = (struct linux_dirent64 __user *)pm_kreg(user_regs, 1);
 
 	count = min(count, GETDENTS_BUF_LIMIT);
 	if (!count)
@@ -1419,7 +1635,7 @@ static int getdents_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 static int getdents_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct getdents_cb_data *d = (struct getdents_cb_data *)ri->data;
-	long ret = regs->regs[0];
+	long ret = pm_syscall_retval(regs);
 	struct linux_dirent64 *kbuf, *prev, *cur;
 	long bpos, new_len;
 	const size_t hdr_off = offsetof(struct linux_dirent64, d_name);
@@ -1480,7 +1696,7 @@ static int getdents_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 			pr_warn_ratelimited(PM_LOG_PREFIX
 					    "copy_to_user failed, directory may leak\n");
 		else
-			regs->regs[0] = new_len;
+			pm_set_syscall_retval(regs, new_len);
 	}
 
 out:
@@ -1508,6 +1724,10 @@ static int __init pathmask_init(void)
 		return ret;
 
 	ret = parse_deny_uids();
+	if (ret)
+		return ret;
+
+	ret = parse_maps_redirect_uids();
 	if (ret)
 		return ret;
 
@@ -1573,13 +1793,13 @@ static int __init pathmask_init(void)
 				(unsigned int)ARRAY_SIZE(pm_syscall_probes));
 		} else {
 			pr_info(PM_LOG_PREFIX
-				"syscall fallback: 0 probes (enable_syscall_hooks=%d, syscall_hooks=\"%s\") -- skipping __arm64_sys_* probes\n",
+				"syscall fallback: 0 probes (enable_syscall_hooks=%d, syscall_hooks=\"%s\") -- skipping syscall entry stub probes\n",
 				enable_syscall_hooks, syscall_hooks);
 		}
 	}
 
 	if (hide_dirents) {
-		kp_getdents.kp.symbol_name = "__arm64_sys_getdents64";
+		kp_getdents.kp.symbol_name = "sys_getdents64";
 		kp_getdents.entry_handler = getdents_entry;
 		kp_getdents.handler = getdents_exit;
 		kp_getdents.data_size = sizeof(struct getdents_cb_data);
@@ -1587,11 +1807,11 @@ static int __init pathmask_init(void)
 		ret = register_kretprobe(&kp_getdents);
 		if (ret) {
 			pr_warn(PM_LOG_PREFIX
-				"register_kretprobe(__arm64_sys_getdents64) failed: %d; listings may leak\n",
+				"register_kretprobe(sys_getdents64) failed: %d; listings may leak\n",
 				ret);
 		} else {
 			getdents_registered = true;
-			pr_info(PM_LOG_PREFIX "hooked __arm64_sys_getdents64\n");
+			pr_info(PM_LOG_PREFIX "hooked sys_getdents64\n");
 		}
 	} else {
 		pr_info(PM_LOG_PREFIX
@@ -1625,4 +1845,4 @@ module_exit(pathmask_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Andrea-lyz");
-MODULE_DESCRIPTION("Selective path masking demo via kretprobes");
+MODULE_DESCRIPTION("Selective path masking + maps redirect via kretprobes");
