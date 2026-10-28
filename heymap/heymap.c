@@ -113,13 +113,6 @@ static bool user_path_is_own_maps(const char __user *uptr)
 		return false;
 	buf[n] = 0;
 
-	if (strstr(buf, "libhoudini.so") || strstr(buf, "libhp15_x86_64.so") ||
-	    strstr(buf, "javahelper/libs/x86_64") ||
-	    strstr(buf, "libjavahelper.so") || strstr(buf, "mumu-configs")) {
-		d->is_enoent = true;
-		return true;
-	}
-
 	if (strncmp(buf, "/proc/self/", 11) == 0) {
 		const char *f = buf + 11;
 
@@ -133,6 +126,11 @@ static bool user_path_is_own_maps(const char __user *uptr)
 			return true;
 		return false;
 	}
+
+	if (strstr(buf, "libhoudini.so") || strstr(buf, "libhp15_x86_64.so") ||
+	    strstr(buf, "javahelper/libs/x86_64") ||
+	    strstr(buf, "libjavahelper.so") || strstr(buf, "mumu-configs"))
+		return true;
 
 	if (strcmp(buf, "/proc/mounts") == 0 ||
 	    strcmp(buf, "/proc/self/mounts") == 0)
@@ -245,8 +243,7 @@ static int hxp_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 		return 0;
 
 	if (d->is_enoent) {
-		if (pm_close_fd)
-			pm_close_fd((unsigned int)ret);
+		close_fd((unsigned int)ret);
 		regs->ax = (unsigned long)-2; /* ENOENT: file does not exist */
 		return 0;
 	}
