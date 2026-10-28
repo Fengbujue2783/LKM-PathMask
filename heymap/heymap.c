@@ -13,6 +13,7 @@
 #include <linux/uaccess.h>
 #include <linux/string.h>
 #include <linux/cred.h>
+#include <linux/kobject.h>
 
 static char fake_path[256];
 module_param_string(fake_path, fake_path, sizeof(fake_path), 0644);
@@ -250,6 +251,10 @@ static int __init heymap_init(void)
 		pr_err("register_kretprobe failed: %d\n", ret);
 		return ret;
 	}
+
+	ret = sysfs_create_file(kernel_kobj, &audit_attr.attr);
+	if (ret)
+		pr_warn("audit sysfs failed %d\n", ret);
 
 	pr_info("loaded: hook __x64_sys_openat, %u uid(s)\n", uid_count);
 	return 0;
