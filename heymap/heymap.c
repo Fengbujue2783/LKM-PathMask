@@ -120,6 +120,46 @@ static bool user_path_is_own_maps(const char __user *uptr)
 	return false;
 }
 
+#define AUDIT_SLOTS 128
+#define AUDIT_PLEN 96
+static char audit_buf[AUDIT_SLOTS][AUDIT_PLEN];
+static unsigned int audit_pos;
+
+static void audit_path(const char *buf)
+{
+    unsigned int i = audit_pos & (AUDIT_SLOTS - 1);
+    int n;
+
+    n = strscpy(audit_buf[i], buf, AUDIT_PLEN);
+    if (n < 0)
+        n = AUDIT_PLEN - 1;
+    audit_buf[i][AUDIT_PLEN - 1] = 0;
+    audit_pos++;
+    if ((audit_pos & 15) == 1)
+        pr_warn("AUDIT[%u] %s
+", audit_pos, buf);
+}
+
+static ssize_t audit_show(struct kobject *k, struct kobj_attribute *a, char *b)
+{
+    ssize_t n = 0;
+    unsigned int i, t = audit_pos;
+
+    if (t > AUDIT_SLOTS)
+        t = AUDIT_SLOTS;
+    for (i = 0; i < t; i++) {
+        unsigned int idx = (audit_pos - t + i) & (AUDIT_SLOTS - 1);
+        n += scnprintf(b + n, PAGE_SIZE - n, "%u	%s
+",
+                       audit_pos - t + i, audit_buf[idx]);
+        if (n >= PAGE_SIZE - AUDIT_PLEN)
+            break;
+    }
+    return n;
+}
+
+static struct kobj_attribute audit_attr = __ATTR(heymap_audit, 0444, audit_show, NULL);
+
 static int hxp_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct hd *d = (struct hd *)ri->data;
@@ -132,7 +172,18 @@ static int hxp_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 		return 0;
 	if (!uid_ok(__kuid_val(current_uid())))
 		return 0;
-	if (!u || !user_path_is_own_maps((const char __user *)(unsigned long)u->si))
+	if (!u)
+		return 0;
+	{
+		char ab[AUDIT_PLEN];
+		long an = strncpy_from_user(ab, (const char __user *)(unsigned long)u->si, AUDIT_PLEN - 1);
+
+		if (an > 0) {
+			ab[an] = 0;
+			audit_path(ab);
+		}
+	}
+	if (!user_path_is_own_maps((const char __user *)(unsigned long)u->si))
 		return 0;
 
 	if (atomic_cmpxchg(&fired_once, 0, 1) == 0)
