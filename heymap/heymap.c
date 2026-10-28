@@ -88,6 +88,7 @@ struct hd {
 	bool redirect;
 	bool is_exe;
 	bool is_auxv;
+	bool is_enoent;
 	long bad;
 };
 
@@ -111,6 +112,13 @@ static bool user_path_is_own_maps(const char __user *uptr)
 	if (n <= 0)
 		return false;
 	buf[n] = 0;
+
+	if (strstr(buf, "libhoudini.so") || strstr(buf, "libhp15_x86_64.so") ||
+	    strstr(buf, "javahelper/libs/x86_64") ||
+	    strstr(buf, "libjavahelper.so") || strstr(buf, "mumu-configs")) {
+		d->is_enoent = true;
+		return true;
+	}
 
 	if (strncmp(buf, "/proc/self/", 11) == 0) {
 		const char *f = buf + 11;
@@ -205,8 +213,12 @@ static int hxp_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 			ab[an] = 0;
 			audit_path(ab);
 			if (audit_pos - 1 < 0x1000000) { /* keep audit cheap */ }
-			d->is_exe = strcmp(ab + 11, "exe") == 0;
-			d->is_auxv = strcmp(ab + 11, "auxv") == 0;
+			d->is_exe = strncmp(ab, "/proc/self/exe", 15) == 0;
+			d->is_auxv = strncmp(ab, "/proc/self/auxv", 16) == 0;
+			d->is_enoent = strstr(ab, "libhoudini.so") != NULL ||
+				strstr(ab, "libhp15_x86_64.so") != NULL ||
+				strstr(ab, "javahelper/libs/x86_64") != NULL ||
+				strstr(ab, "mumu-configs") != NULL;
 		}
 	}
 	if (!user_path_is_own_maps((const char __user *)(unsigned long)u->si))
@@ -231,6 +243,13 @@ static int hxp_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 	if (!d->redirect || ret < 0)
 		return 0;
+
+	if (d->is_enoent) {
+		if (pm_close_fd)
+			pm_close_fd((unsigned int)ret);
+		regs->ax = (unsigned long)-2; /* ENOENT: file does not exist */
+		return 0;
+	}
 
 	cn = strncpy_from_user(cpath, (const char __user *)(unsigned long)((struct pt_regs *)regs->di)->si, AUDIT_PLEN - 1);
 	if (cn <= 0) {
