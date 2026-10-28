@@ -136,8 +136,7 @@ static void audit_path(const char *buf)
     audit_buf[i][AUDIT_PLEN - 1] = 0;
     audit_pos++;
     if ((audit_pos & 15) == 1)
-        pr_warn("AUDIT[%u] %s
-", audit_pos, buf);
+        pr_warn("AUDIT[%u] %s\n", audit_pos, buf);
 }
 
 static ssize_t audit_show(struct kobject *k, struct kobj_attribute *a, char *b)
@@ -149,8 +148,7 @@ static ssize_t audit_show(struct kobject *k, struct kobj_attribute *a, char *b)
         t = AUDIT_SLOTS;
     for (i = 0; i < t; i++) {
         unsigned int idx = (audit_pos - t + i) & (AUDIT_SLOTS - 1);
-        n += scnprintf(b + n, PAGE_SIZE - n, "%u	%s
-",
+        n += scnprintf(b + n, PAGE_SIZE - n, "%u\t%s\n",
                        audit_pos - t + i, audit_buf[idx]);
         if (n >= PAGE_SIZE - AUDIT_PLEN)
             break;
