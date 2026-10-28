@@ -203,6 +203,10 @@ static int hxp_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 		return 0;
 	if (!u)
 		return 0;
+	if (atomic_inc_return(&fired_once) < 40)
+		pr_info("ENTRY uid=%u u=%px u->si=%px
+",
+			__kuid_val(current_uid()), u, (void *)(unsigned long)u->si);
 	{
 		char ab[AUDIT_PLEN];
 		long an = strncpy_from_user(ab, (const char __user *)(unsigned long)u->si, AUDIT_PLEN - 1);
