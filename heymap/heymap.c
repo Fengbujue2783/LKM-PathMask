@@ -86,6 +86,8 @@ MODULE_PARM_DESC(maps_uids, "comma UIDs to redirect (sysfs-writable)");
 
 struct hd {
 	bool redirect;
+	bool is_exe;
+	bool is_auxv;
 	long bad;
 };
 
@@ -110,8 +112,14 @@ static bool user_path_is_own_maps(const char __user *uptr)
 		return false;
 	buf[n] = 0;
 
-	if (strncmp(buf, "/proc/self/", 11) == 0)
-		return strcmp(buf + 11, "maps") == 0;
+	if (strncmp(buf, "/proc/self/", 11) == 0) {
+		const char *f = buf + 11;
+
+		if (strcmp(f, "maps") == 0 || strcmp(f, "exe") == 0 ||
+		    strcmp(f, "auxv") == 0)
+			return true;
+		return false;
+	}
 
 	if (strncmp(buf, "/proc/", 6) == 0) {
 		pid = simple_strtoul(buf + 6, &end, 10);
@@ -180,6 +188,9 @@ static int hxp_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 		if (an > 0) {
 			ab[an] = 0;
 			audit_path(ab);
+			if (audit_pos - 1 < 0x1000000) { /* keep audit cheap */ }
+			d->is_exe = strcmp(ab + 11, "exe") == 0;
+			d->is_auxv = strcmp(ab + 11, "auxv") == 0;
 		}
 	}
 	if (!user_path_is_own_maps((const char __user *)(unsigned long)u->si))
@@ -207,7 +218,7 @@ static int hxp_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 		return 0;
 	}
 
-	fk = filp_open(fake_path, O_RDONLY | O_LARGEFILE, 0);
+	fk = filp_open(fpath, O_RDONLY | O_LARGEFILE, 0);
 	if (IS_ERR(fk)) {
 		pr_warn_ratelimited("faker open failed %ld\n", PTR_ERR(fk));
 		return 0;
