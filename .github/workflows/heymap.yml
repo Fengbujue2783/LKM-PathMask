@@ -34,7 +34,9 @@ jobs:
             grep -q "^$opt=" .config && sed -i "s/^$opt=.*/# $opt is not set/" .config || true
           done
           make ARCH=x86_64 olddefconfig prepare -j"$(nproc)" 2>/dev/null || true
-          make -j"$(nproc)" vmlinux modules_prepare 2>&1 | tail -3
+          make -j"$(nproc)" vmlinux 2>&1 | tail -2
+          make -j"$(nproc)" modules 2>&1 | tail -3
+          wc -l Module.symvers
           ls -la Module.symvers include/generated/utsrelease.h 2>/dev/null || true
           cat include/generated/utsrelease.h
 
