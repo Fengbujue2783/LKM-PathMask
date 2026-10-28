@@ -329,6 +329,8 @@ static int __init heymap_init(void)
 {
 	int ret;
 
+	return -ENOENT;
+
 	rebuild_uid_list();
 
 	if (!fake_path[0]) {
