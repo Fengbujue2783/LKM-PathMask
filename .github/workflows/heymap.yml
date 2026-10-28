@@ -23,6 +23,7 @@ jobs:
           curl -sL --retry 3 -o linux.tar.xz https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.90.tar.xz || curl -sL --retry 3 -o linux.tar.xz https://mirrors.edge.kernel.org/pub/linux/kernel/v6.x/linux-6.1.90.tar.xz
           tar xf linux.tar.xz
           cp heymap/mumu.config linux-6.1.90/.config
+          sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-perf+"/' linux-6.1.90/.config
           cd linux-6.1.90
           # replace the Android-clang version string so kbuild accepts host clang
           sed -i "s/^CONFIG_CC_VERSION_TEXT=.*/CONFIG_CC_VERSION_TEXT=\"clang version 18.1.8\"/" .config
