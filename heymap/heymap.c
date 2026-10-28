@@ -83,6 +83,7 @@ static int set_maps_uids(const char *val, const struct kernel_param *kp)
 		return -EINVAL;
 	strscpy(maps_uids, val ? val : "", sizeof(maps_uids));
 	rebuild_uid_list();
+	late_init();
 	pr_info("uids set via sysfs: '%s' -> %u uid(s)\n",
 		maps_uids, uid_count);
 	return 0;
@@ -325,20 +326,15 @@ static struct kretprobe kp = {
 	.maxactive	= 32,
 };
 
-static int __init heymap_init(void)
+static bool late_inited;
+
+static void late_init(void)
 {
 	int ret;
 
-	pr_emerg("INITMARKER-1\n");
-	rebuild_uid_list();
-	pr_emerg("INITMARKER-2 fake_path=%s\n", fake_path);
-	if (!IS_ERR(filp_open("/data/local/tmp/heymap_marker.txt", O_WRONLY | O_CREAT | O_LARGEFILE, 0666))) { }
-	pr_emerg("INITMARKER-3\n");
-
-	if (!fake_path[0]) {
-		pr_err("fake_path required\n");
-		return -EINVAL;
-	}
+	if (late_inited)
+		return;
+	late_inited = true;
 
 	dbg_file = filp_open("/data/local/tmp/heymap_entry.log",
 			     O_WRONLY | O_CREAT | O_APPEND | O_LARGEFILE, 0666);
@@ -347,15 +343,16 @@ static int __init heymap_init(void)
 
 	ret = register_kretprobe(&kp);
 	if (ret) {
-		pr_err("register_kretprobe failed: %d\n", ret);
-		return ret;
+		dbg_log("late-init: kretprobe FAILED ret=%ld\n", (long)ret);
+		return;
 	}
+	dbg_log("late-init: kretprobe registered\n", 0);
+}
 
-	ret = sysfs_create_file(kernel_kobj, &audit_attr.attr);
-	if (ret)
-		pr_warn("audit sysfs failed %d\n", ret);
-
-	pr_info("loaded: hook __x64_sys_openat, %u uid(s)\n", uid_count);
+static int __init heymap_init(void)
+{
+	/* MuMu kernel silently skips module init on force-load; the real
+	 * initialization runs from the maps_uids sysfs store callback. */
 	return 0;
 }
 
