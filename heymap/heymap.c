@@ -46,6 +46,7 @@ static unsigned int uid_count;
 static atomic_t fired_once = ATOMIC_INIT(0);
 
 static char maps_uids[512];
+static void late_init(void);
 
 static void rebuild_uid_list(void)
 {
@@ -205,7 +206,7 @@ static ssize_t audit_show(struct kobject *k, struct kobj_attribute *a, char *b)
     return n;
 }
 
-static struct kobj_attribute audit_attr = __ATTR(heymap_audit, 0444, audit_show, NULL);
+static struct kobj_attribute audit_attr __maybe_unused = __ATTR(heymap_audit, 0444, audit_show, NULL);
 
 static int hxp_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
