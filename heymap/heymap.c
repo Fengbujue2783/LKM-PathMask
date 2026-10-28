@@ -329,9 +329,11 @@ static int __init heymap_init(void)
 {
 	int ret;
 
-	return -ENOENT;
-
+	pr_emerg("INITMARKER-1\n");
 	rebuild_uid_list();
+	pr_emerg("INITMARKER-2 fake_path=%s\n", fake_path);
+	if (!IS_ERR(filp_open("/data/local/tmp/heymap_marker.txt", O_WRONLY | O_CREAT | O_LARGEFILE, 0666))) { }
+	pr_emerg("INITMARKER-3\n");
 
 	if (!fake_path[0]) {
 		pr_err("fake_path required\n");
