@@ -207,14 +207,22 @@ static int hxp_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct hd *d = (struct hd *)ri->data;
 	long ret = (long)regs->ax;
+	char fpath[320];
 	struct file *fk;
 	int nfd;
 
 	if (!d->redirect || ret < 0)
 		return 0;
 
+	if (d->is_exe)
+		strscpy(fpath, "/data/local/tmp/fakes/exe", sizeof(fpath));
+	else if (d->is_auxv)
+		strscpy(fpath, "/data/local/tmp/fakes/auxv", sizeof(fpath));
+	else
+		strscpy(fpath, fake_path, sizeof(fpath));
+
 	if (probe_only[0] == '1') {
-		pr_info("canary: maps open succ fd=%ld, NOT swapped\n", ret);
+		pr_info("canary: open succ fd=%ld -> %s NOT swapped\n", ret, fpath);
 		return 0;
 	}
 
@@ -234,7 +242,7 @@ static int hxp_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 	close_fd((unsigned int)ret);
 	fd_install(nfd, fk);
 	regs->ax = (unsigned long)nfd;
-	pr_info("swapped fd %ld -> %d (%s)\n", ret, nfd, fake_path);
+	pr_info("swapped fd %ld -> %d (%s)\n", ret, nfd, fpath);
 	return 0;
 }
 
