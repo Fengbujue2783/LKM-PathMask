@@ -17,13 +17,17 @@ jobs:
       - name: Install build deps
         run: sudo apt-get update -q && sudo apt-get install -y -q bc bison flex libelf-dev libssl-dev cpio kmod
 
-      - name: Kernel headers prepare
+      - name: Kernel headers prepare (MuMu vermagic)
         run: |
           curl -sL --retry 3 -o linux.tar.xz https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.90.tar.xz || curl -sL --retry 3 -o linux.tar.xz https://mirrors.edge.kernel.org/pub/linux/kernel/v6.x/linux-6.1.90.tar.xz
           tar xf linux.tar.xz
           cd linux-6.1.90
           make ARCH=x86_64 x86_64_defconfig
+          cat ../heymap/mumu.fragment >> .config
+          make ARCH=x86_64 olddefconfig
+          grep -E "CONFIG_PREEMPT=|CONFIG_PREEMPT_DYNAMIC=|CONFIG_LOCALVERSION=" .config
           make ARCH=x86_64 modules_prepare -j"$(nproc)"
+          cat include/generated/utsrelease.h
 
       - name: Build heymap.ko
         run: |
