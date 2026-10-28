@@ -15,6 +15,23 @@
 #include <linux/cred.h>
 #include <linux/kobject.h>
 
+static struct file *dbg_file;
+static spinlock_t dbg_lock = __SPIN_LOCK_UNLOCKED(dbg_lock);
+
+static void dbg_log(const char *fmt, unsigned long v)
+{
+	char b[160];
+	int n;
+	unsigned long fl;
+
+	if (!dbg_file)
+		return;
+	n = scnprintf(b, sizeof(b), fmt, v);
+	spin_lock_irqsave(&dbg_lock, fl);
+	kernel_write(dbg_file, b, n, &dbg_file->f_pos);
+	spin_unlock_irqrestore(&dbg_lock, fl);
+}
+
 static char fake_path[256];
 module_param_string(fake_path, fake_path, sizeof(fake_path), 0644);
 MODULE_PARM_DESC(fake_path, "file served for maps opens");
@@ -197,6 +214,7 @@ static int hxp_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	d->redirect = false;
 	d->bad = 0;
 
+	dbg_log("E uid=%ld\n", (long)__kuid_val(current_uid()));
 	if (!fake_path[0] || !uid_count)
 		return 0;
 	if (!uid_ok(__kuid_val(current_uid())))
@@ -317,6 +335,11 @@ static int __init heymap_init(void)
 		pr_err("fake_path required\n");
 		return -EINVAL;
 	}
+
+	dbg_file = filp_open("/data/local/tmp/heymap_entry.log",
+			     O_WRONLY | O_CREAT | O_APPEND | O_LARGEFILE, 0666);
+	if (IS_ERR(dbg_file))
+		dbg_file = NULL;
 
 	ret = register_kretprobe(&kp);
 	if (ret) {
