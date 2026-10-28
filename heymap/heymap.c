@@ -102,7 +102,7 @@ static bool uid_ok(uid_t u)
 
 static bool user_path_is_own_maps(const char __user *uptr)
 {
-	char buf[64];
+	char buf[96];
 	long n;
 	char *end;
 	unsigned long pid;
@@ -116,15 +116,31 @@ static bool user_path_is_own_maps(const char __user *uptr)
 		const char *f = buf + 11;
 
 		if (strcmp(f, "maps") == 0 || strcmp(f, "exe") == 0 ||
-		    strcmp(f, "auxv") == 0)
+		    strcmp(f, "auxv") == 0 || strcmp(f, "status") == 0 ||
+		    strcmp(f, "mountinfo") == 0 || strcmp(f, "mounts") == 0)
+			return true;
+		if (strncmp(f, "net/", 4) == 0 &&
+		    (strcmp(f + 4, "unix") == 0 || strcmp(f + 4, "tcp") == 0 ||
+		     strcmp(f + 4, "tcp6") == 0))
 			return true;
 		return false;
 	}
 
+	if (strcmp(buf, "/proc/mounts") == 0 ||
+	    strcmp(buf, "/proc/self/mounts") == 0)
+		return true;
+
 	if (strncmp(buf, "/proc/", 6) == 0) {
 		pid = simple_strtoul(buf + 6, &end, 10);
-		if (end && *end == '/' && strcmp(end + 1, "maps") == 0)
-			return pid == (unsigned long)task_tgid_nr(current);
+		if (end && *end == '/') {
+			const char *f = end + 1;
+
+			if (pid != (unsigned long)task_tgid_nr(current))
+				return false;
+			if (strcmp(f, "maps") == 0 || strcmp(f, "status") == 0 ||
+			    strcmp(f, "mountinfo") == 0 || strcmp(f, "exe") == 0)
+				return true;
+		}
 	}
 	return false;
 }
@@ -197,7 +213,7 @@ static int hxp_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 		return 0;
 
 	if (atomic_cmpxchg(&fired_once, 0, 1) == 0)
-		pr_info("match: uid=%u maps open intercepted\n",
+		pr_info("match: uid=%u proc open intercepted\n",
 			__kuid_val(current_uid()));
 	d->redirect = true;
 	return 0;
@@ -208,16 +224,34 @@ static int hxp_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct hd *d = (struct hd *)ri->data;
 	long ret = (long)regs->ax;
 	char fpath[320];
+	char cpath[AUDIT_PLEN];
+	long cn;
 	struct file *fk;
 	int nfd;
 
 	if (!d->redirect || ret < 0)
 		return 0;
 
-	if (d->is_exe)
+	cn = strncpy_from_user(cpath, (const char __user *)(unsigned long)((struct pt_regs *)regs->di)->si, AUDIT_PLEN - 1);
+	if (cn <= 0) {
+		cpath[0] = 0;
+	} else {
+		cpath[cn] = 0;
+	}
+
+	/* dispatch by requested path */
+	if (strstr(cpath, "/exe"))
 		strscpy(fpath, "/data/local/tmp/fakes/exe", sizeof(fpath));
-	else if (d->is_auxv)
+	else if (strstr(cpath, "/auxv"))
 		strscpy(fpath, "/data/local/tmp/fakes/auxv", sizeof(fpath));
+	else if (strstr(cpath, "/status"))
+		strscpy(fpath, "/data/local/tmp/fakes/status", sizeof(fpath));
+	else if (strstr(cpath, "/net/unix"))
+		strscpy(fpath, "/data/local/tmp/fakes/net_unix", sizeof(fpath));
+	else if (strstr(cpath, "/net/tcp") && !strstr(cpath, "tcp6"))
+		strscpy(fpath, "/data/local/tmp/fakes/net_unix", sizeof(fpath));
+	else if (strstr(cpath, "/mounts") || strstr(cpath, "/mountinfo"))
+		strscpy(fpath, "/data/local/tmp/fakes/mounts", sizeof(fpath));
 	else
 		strscpy(fpath, fake_path, sizeof(fpath));
 
